@@ -22,14 +22,19 @@ serve(async (req) => {
       throw new Error('Missing required fields: phoneNumber or amount');
     }
 
-    // Format phone number for Lipwa (must be in format +254XXXXXXXXX)
+    // Format phone number for Lipwa using the documented 254XXXXXXXXX format.
+    // Sending a leading + can be accepted by the API but fail downstream before STK delivery.
     let formattedPhone = phoneNumber.replace(/\D/g, ''); // Remove non-digits
     if (formattedPhone.startsWith('0')) {
-      formattedPhone = '+254' + formattedPhone.substring(1);
+      formattedPhone = '254' + formattedPhone.substring(1);
     } else if (formattedPhone.startsWith('254')) {
-      formattedPhone = '+' + formattedPhone;
-    } else if (!formattedPhone.startsWith('+254')) {
-      formattedPhone = '+254' + formattedPhone;
+      formattedPhone = formattedPhone;
+    } else if (!formattedPhone.startsWith('254')) {
+      formattedPhone = '254' + formattedPhone;
+    }
+
+    if (!/^254(7|1)\d{8}$/.test(formattedPhone)) {
+      throw new Error('Please enter a valid Safaricom M-Pesa number');
     }
 
     console.log('Formatted phone:', formattedPhone);
@@ -64,6 +69,37 @@ serve(async (req) => {
 
     console.log('Lipwa payload:', { ...lipwaPayload, api_ref: reference });
 
+    // Store the reference before sending the request so fast callbacks cannot arrive first.
+    const supabase = createClient(
+      supabaseUrl,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+
+    // Get user ID from authorization header
+    const authHeader = req.headers.get('Authorization');
+    let userId = null;
+    
+    if (authHeader) {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user } } = await supabase.auth.getUser(token);
+      userId = user?.id;
+    }
+
+    if (depositType === 'savings' && userId) {
+      const { error: insertError } = await supabase.from('savings_deposits').insert({
+        user_id: userId,
+        amount: Math.floor(amount),
+        mpesa_message: `STK Push initiated - Reference: ${reference}`,
+        transaction_code: reference,
+        verified: false,
+      });
+
+      if (insertError) {
+        console.error('Error creating deposit record:', insertError);
+        throw new Error('Could not start payment tracking. Please try again.');
+      }
+    }
+
     // Send STK push request to Lipwa
     const lipwaResponse = await fetch(
       'https://pay.lipwa.app/api/payments',
@@ -84,32 +120,7 @@ serve(async (req) => {
       throw new Error(lipwaResult.message || lipwaResult.error || 'Failed to initiate payment');
     }
 
-    // Store the reference for tracking
-    const supabase = createClient(
-      supabaseUrl,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    );
-
-    // Get user ID from authorization header
-    const authHeader = req.headers.get('Authorization');
-    let userId = null;
-    
-    if (authHeader) {
-      const token = authHeader.replace('Bearer ', '');
-      const { data: { user } } = await supabase.auth.getUser(token);
-      userId = user?.id;
-    }
-
-    if (depositType === 'savings' && userId) {
-      // Create savings deposit record
-      await supabase.from('savings_deposits').insert({
-        user_id: userId,
-        amount: Math.floor(amount),
-        mpesa_message: `STK Push initiated - Reference: ${reference}`,
-        transaction_code: reference,
-        verified: false,
-      });
-    } else if (applicationId) {
+    if (applicationId) {
       // Create loan disbursement record
       await supabase.from('loan_disbursements').insert({
         application_id: applicationId,
